@@ -13,5 +13,10 @@
   },
   "require-dev": {
     "phpunit/phpunit": "^10.5 || ^11 || ^12"
+  },
+  "scripts": {
+    "demo:image": "php examples/demo.php IMAGE",
+    "demo:audio": "php examples/demo.php AUDIO",
+    "demo:video": "php examples/demo.php VIDEO"
   }
 }
