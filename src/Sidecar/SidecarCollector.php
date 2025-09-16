@@ -4,53 +4,68 @@ declare(strict_types=1);
 
 namespace WApp\StreamCrypto\Sidecar;
 
-use WApp\StreamCrypto\Crypto\Mac;
-
 final class SidecarCollector
 {
     private const K = 65536;
     private const OVERLAP = 16;
 
-    private string $buffer = '';  // скользящее окно enc данных
+    private string $macKey;
+    private string $buf = '';      // окно начиная с $bufStart
+    private int    $bufStart = 0;  // абсолютный оффсет начала buf
+    private int    $total = 0;     // сколько шифротекста обработано всего
+    private int    $nextStart = 0; // абсолютный оффсет начала следующего окна n*64K
     private string $sidecar = '';
-    private int $nextStart = 0;   // старт следующего окна
-    private ?string $macKey = null;
 
-    public function onCiphertextChunk(string $cipherChunk): void
+    public function withMacKey(string $macKey): self
     {
-        $this->buffer .= $cipherChunk;
+        $this->macKey = $macKey;
+        return $this;
+    }
 
-        // пока у нас хватает байт, считаем окно
-        while (\strlen($this->buffer) >= ($this->nextStart + self::K + self::OVERLAP)) {
-            $slice = \substr($this->buffer, $this->nextStart, self::K + self::OVERLAP);
-            if ($this->macKey) {
-                $this->sidecar .= Mac::hmacSha256($this->macKey, $slice, 10);
-            }
+    /** Кормим готовым шифротекстом (любого размера) */
+    public function feed(string $cipherChunk): void
+    {
+        $this->buf .= $cipherChunk;
+        $this->total += \strlen($cipherChunk);
+
+        // пока доступно окно [nextStart, nextStart+K+16]
+        while ($this->bufStart + \strlen($this->buf) >= $this->nextStart + self::K + self::OVERLAP) {
+            $local = $this->nextStart - $this->bufStart;
+            $slice = \substr($this->buf, $local, self::K + self::OVERLAP);
+            $this->sidecar .= \substr(\hash_hmac('sha256', $slice, $this->macKey, true), 0, 10);
             $this->nextStart += self::K;
-        }
 
-        // чистим «левую» часть буфера, которая больше не понадобится
-        if ($this->nextStart > 0) {
-            $this->buffer = \substr($this->buffer, $this->nextStart);
-            $this->nextStart = 0;
+            // можно отбросить всё левее nextStart — больше не понадобится
+            $drop = $this->nextStart - $this->bufStart;
+            if ($drop > 0 && $drop <= \strlen($this->buf)) {
+                $this->buf = \substr($this->buf, $drop);
+                $this->bufStart += $drop;
+            }
         }
     }
 
-    public function finalize(string $macKey): void
+    /** Завершаем и подписываем последний неполный кусок (если остался) */
+    public function finalize(): void
     {
-        $this->macKey = $macKey;
+        // после EOF генерим все оставшиеся окна, включая последнее частичное
+        while ($this->bufStart < $this->total) {
+            $end = \min($this->total, $this->nextStart + self::K + self::OVERLAP);
+            if ($end <= $this->nextStart) { break; }
+            $localStart = $this->nextStart - $this->bufStart;
+            if ($localStart < 0) { $localStart = 0; }
+            $slice = \substr($this->buf, $localStart, $end - $this->nextStart);
+            if ($slice === '') { break; }
+            $this->sidecar .= \substr(\hash_hmac('sha256', $slice, $this->macKey, true), 0, 10);
+            $this->nextStart += self::K;
 
-        // добиваем все окна, которые можно сформировать на остатках
-        while (\strlen($this->buffer) >= (self::K + self::OVERLAP)) {
-            $slice = \substr($this->buffer, 0, self::K + self::OVERLAP);
-            $this->sidecar .= Mac::hmacSha256($macKey, $slice, 10);
-            $this->buffer = \substr($this->buffer, self::K); // сдвиг на 64K (перекрытие 16 байт учтено в слайсе)
-        }
-
-        // крайний частичный чанк (если остался) — тоже подписываем
-        if ($this->buffer !== '') {
-            $this->sidecar .= Mac::hmacSha256($macKey, $this->buffer, 10);
-            $this->buffer = '';
+            // отбрасываем ненужное слева
+            $drop = $this->nextStart - $this->bufStart;
+            if ($drop > 0 && $drop <= \strlen($this->buf)) {
+                $this->buf = \substr($this->buf, $drop);
+                $this->bufStart += $drop;
+            } else {
+                break;
+            }
         }
     }
 

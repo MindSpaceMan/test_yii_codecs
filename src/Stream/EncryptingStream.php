@@ -7,7 +7,6 @@ namespace WApp\StreamCrypto\Stream;
 use Psr\Http\Message\StreamInterface;
 use WApp\StreamCrypto\KeySchedule;
 use WApp\StreamCrypto\MediaType;
-use WApp\StreamCrypto\Crypto\AesCbc;
 use WApp\StreamCrypto\Crypto\Mac;
 use WApp\StreamCrypto\Exception\StreamException;
 use WApp\StreamCrypto\Sidecar\SidecarCollector;
@@ -15,97 +14,115 @@ use WApp\StreamCrypto\Sidecar\SidecarCollector;
 final class EncryptingStream implements StreamInterface
 {
     private const BLOCK = 16;
-    private const CHUNK = 8192; // чтение из источника
+    private const IN_CHUNK = 8192;
 
     private StreamInterface $in;
-    private string $iv;
+
     private string $cipherKey;
-    private string $macKey;
+    private string $prev;          // предыдущий шифроблок (IV сначала)
 
-    private string $encBuf = '';     // зашифрованные данные, ещё не выданные наружу
-    private string $macState;        // накапливаем H(iv||enc) — через update
-    private bool   $sourceEof = false;
-    private bool   $finalized = false;
-    private int    $cursor = 0;      // позиция чтения наружу
+    /** @var resource HMAC контекст */
+    private $hmacCtx;
 
-    // для «звёздочки»: сборка сайдкара без второго прохода
-    private ?\WApp\StreamCrypto\Sidecar\SidecarCollector $sidecar = null;
+    private string $tail = '';     // неполный plaintext < 16
+    private string $outBuf = '';   // готовые к выдаче байты
+    private int    $outPos = 0;    // смещение внутри outBuf
 
-    public function __construct(StreamInterface $plain, string $mediaKey32, MediaType $type, SidecarCollector $collector = null)
-    {
+    private bool   $srcEof = false;
+    private bool   $macAppended = false;
+
+    private ?SidecarCollector $sidecar;
+
+    public function __construct(
+        StreamInterface $plain,
+        string $mediaKey32,
+        MediaType $type,
+        ?SidecarCollector $sidecar = null
+    ) {
         $this->in = $plain;
         [$iv, $ck, $mk] = KeySchedule::derive($mediaKey32, $type);
-        $this->iv = $iv;
         $this->cipherKey = $ck;
-        $this->macKey = $mk;
-
-        $this->macState = $iv; // H(iv || enc), начальная часть — iv
-        $this->sidecar = $collector;
+        $this->prev = $iv;
+        $this->hmacCtx = \hash_init('sha256', \HASH_HMAC, $mk);
+        \hash_update($this->hmacCtx, $iv); // H(iv || enc)
+        $this->sidecar = $sidecar?->withMacKey($mk) ?? null;
     }
 
-    private function pump(): void
+    private function encryptBlock(string $plainBlock, bool $isFinal): string
     {
-        if ($this->finalized) { return; }
+        // CBC делаем вручную: XOR с prev, затем AES-ECB без паддинга
+        $xored = $plainBlock ^ $this->prev;
+        $c = \openssl_encrypt($xored, 'aes-256-ecb', $this->cipherKey, \OPENSSL_RAW_DATA|\OPENSSL_ZERO_PADDING);
+        if ($c === false) { throw new \RuntimeException('openssl_encrypt failed'); }
+        $this->prev = $c;
 
-        // читаем сырой plaintext
-        $chunk = $this->in->read(self::CHUNK);
-        if ($chunk === '') {
-            $this->sourceEof = true;
-        }
+        // HMAC на лету
+        \hash_update($this->hmacCtx, $c);
 
-        // накопим до целых блоков, финальный блок паддим
-        static $tail = '';
-        $tail .= $chunk;
+        // sidecar окно питаем шифротекстом
+        $this->sidecar?->feed($c);
 
-        if (!$this->sourceEof && \strlen($tail) < self::BLOCK) {
-            return; // мало данных
-        }
+        return $c;
+    }
 
-        $toEnc = $tail;
-        $isFinal = false;
+    private function pump(int $need): void
+    {
+        if ($this->macAppended) { return; }
 
-        if (!$this->sourceEof) {
-            $rem = \strlen($toEnc) % self::BLOCK;
-            if ($rem !== 0) {
-                $emit = \substr($toEnc, 0, -$rem);
-                $tail = \substr($toEnc, -$rem);
-                $toEnc = $emit;
-            } else {
-                $tail = '';
-            }
-        } else {
-            // источник закончился — паддим финальный блок
-            $isFinal = true;
-            $tail = '';
-        }
+        // подаём столько шифротекста, чтобы покрыть запрос
+        while ((\strlen($this->outBuf) - $this->outPos) < $need && !$this->macAppended) {
 
-        if ($toEnc !== '') {
-            $cipher = AesCbc::encryptBlocks($toEnc, $this->cipherKey, $this->iv, $isFinal);
-            // обновляем IV цепочки
-            if ($isFinal) {
-                $last = \substr($cipher, -self::BLOCK);
-                $this->iv = $last; // уже не важно, но логично
-            } else {
-                $this->iv = \substr($cipher, -self::BLOCK);
+            if (!$this->srcEof) {
+                $chunk = $this->in->read(self::IN_CHUNK);
+                if ($chunk === '') { $this->srcEof = true; }
+                else { $this->tail .= $chunk; }
             }
 
-            // апдейтим MAC и sidecar
-            $this->macState .= $cipher;
-            if ($this->sidecar) { $this->sidecar->onCiphertextChunk($cipher); }
+            if (!$this->srcEof && \strlen($this->tail) < self::BLOCK) {
+                // ждём ещё данных
+                break;
+            }
 
-            $this->encBuf .= $cipher;
+            if ($this->srcEof) {
+                // финальный паддинг
+                $pad = self::BLOCK - (\strlen($this->tail) % self::BLOCK);
+                if ($pad === 0) { $pad = self::BLOCK; }
+                $this->tail .= \str_repeat(\chr($pad), $pad);
+
+                // шифруем все блоки (включая паддинг)
+                for ($i = 0, $n = \strlen($this->tail); $i < $n; $i += self::BLOCK) {
+                    $block = \substr($this->tail, $i, self::BLOCK);
+                    $this->outBuf .= $this->encryptBlock($block, true);
+                }
+                $this->tail = '';
+
+                // HMAC финализируем и дописываем 10 байт MAC
+                $mac10 = \substr(\hash_final($this->hmacCtx, true), 0, 10);
+                $this->sidecar?->finalize(); // докинет последние окна
+                $this->outBuf .= $mac10;
+                $this->macAppended = true;
+                break;
+            }
+
+            // у нас есть >= 16 байт, отдадим целые блоки
+            $emitLen = \strlen($this->tail) - (\strlen($this->tail) % self::BLOCK);
+            if ($emitLen > 0) {
+                for ($i = 0; $i < $emitLen; $i += self::BLOCK) {
+                    $block = \substr($this->tail, $i, self::BLOCK);
+                    $this->outBuf .= $this->encryptBlock($block, false);
+                }
+                $this->tail = \substr($this->tail, $emitLen);
+            }
         }
 
-        if ($this->sourceEof) {
-            // финализация: считаем MAC(iv||enc) и дописываем 10 байт
-            $mac = Mac::hmacSha256($this->macKey, $this->macState, 10);
-            if ($this->sidecar) { $this->sidecar->finalize($this->macKey); }
-            $this->encBuf .= $mac;
-            $this->finalized = true;
+        // небольшой «гарбедж-коллектор» для outBuf, чтобы не рос из-за outPos
+        if ($this->outPos > 1 << 20 || $this->outPos === \strlen($this->outBuf)) {
+            $this->outBuf = \substr($this->outBuf, $this->outPos);
+            $this->outPos = 0;
         }
     }
 
-    // --- StreamInterface (read-only) ---
+    // --- PSR-7 ---
 
     public function __toString(): string
     { try { $this->rewind(); return $this->getContents(); } catch (\Throwable) { return ''; } }
@@ -114,33 +131,27 @@ final class EncryptingStream implements StreamInterface
     public function getSize(): ?int
     { return null; }
     public function tell(): int
-    { return $this->cursor; }
-    public function eof(): bool { return $this->finalized && $this->cursor >= \strlen($this->encBuf); }
+    { return $this->outPos; }
+    public function eof(): bool { return $this->macAppended && $this->outPos >= \strlen($this->outBuf); }
     public function isSeekable(): bool { return false; }
     public function seek($offset, $whence = SEEK_SET): void
     { throw new StreamException('EncryptingStream is not seekable'); }
     public function rewind(): void
-    { $this->cursor = 0; }
+    { $this->outBuf=''; $this->outPos=0; $this->tail=''; $this->srcEof=true; /* не поддерживаем повтор */ }
     public function isWritable(): bool { return false; }
     public function write($string): int
-    { throw new StreamException('EncryptingStream is read-only'); }
+    { throw new StreamException('read-only'); }
     public function isReadable(): bool { return true; }
 
     public function read($length): string
     {
-        while (!$this->finalized && \strlen($this->encBuf) - $this->cursor < $length) {
-            $this->pump();
-            if (!$this->finalized && $this->encBuf === '') {
-                // ждём больше данных
-                break;
-            }
-        }
+        if ($length <= 0) { return ''; }
+        if (!$this->macAppended) { $this->pump($length); }
 
-        $available = \strlen($this->encBuf) - $this->cursor;
+        $available = \strlen($this->outBuf) - $this->outPos;
         $n = \max(0, \min($length, $available));
-
-        $out = \substr($this->encBuf, $this->cursor, $n);
-        $this->cursor += $n;
+        $out = $n ? \substr($this->outBuf, $this->outPos, $n) : '';
+        $this->outPos += $n;
         return $out;
     }
 
@@ -155,7 +166,6 @@ final class EncryptingStream implements StreamInterface
 
     public function getMetadata($key = null){ return null; }
 
-    // для «звёздочки»
     public function getSidecarBytes(): ?string
     {
         return $this->sidecar?->sidecar();
